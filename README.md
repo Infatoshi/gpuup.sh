@@ -38,6 +38,3 @@ By default the installer keeps or installs the proprietary NVIDIA driver branch 
 
 `config/` stores policy and tooling settings for the agent harness. Leave these files in place unless you intend to change the automation rules.
 
-## Provenance Log
-
-Record notable alterations in `PROVE.md` (why, what changed, how to validate). This keeps a lightweight audit trail even without git history.
