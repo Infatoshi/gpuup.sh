@@ -196,10 +196,21 @@ gpuup_detect_installed_versions() {
   GPUUP_INSTALLED_DRIVER="not detected"
   GPUUP_INSTALLED_CUDA="not detected"
   if gpuup_have nvidia-smi; then
-    local driver
-    driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]')
-    if [[ -n "$driver" ]]; then
-      GPUUP_INSTALLED_DRIVER="$driver"
+    local smi_output driver
+    if ! smi_output=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1); then
+      if [[ "$smi_output" == *"Driver/library version mismatch"* ]]; then
+        GPUUP_DRIVER_PENDING_REBOOT=1
+        GPUUP_NVSMI_FAILURE_MESSAGE="$smi_output"
+      elif [[ -z "$smi_output" ]]; then
+        GPUUP_NVSMI_FAILURE_MESSAGE="nvidia-smi failed during driver detection."
+      else
+        GPUUP_NVSMI_FAILURE_MESSAGE="$smi_output"
+      fi
+    else
+      driver=$(printf '%s\n' "$smi_output" | head -n1 | tr -d '[:space:]')
+      if [[ -n "$driver" ]]; then
+        GPUUP_INSTALLED_DRIVER="$driver"
+      fi
     fi
   fi
   if gpuup_detect_nvcc_path && nvcc --version >/dev/null 2>&1; then
@@ -213,12 +224,13 @@ gpuup_detect_installed_versions() {
   fi
 }
 
-GPUUP_SUPPORTED_CUDA=("12.4" "12.6" "12.8" "12.9")
-GPUUP_DEFAULT_CUDA="12.9"
+GPUUP_SUPPORTED_CUDA=("13.0" "12.9" "12.8" "12.6" "12.4")
+GPUUP_DEFAULT_CUDA="13.0"
 GPUUP_DRIVER_BRANCHES=("580" "575" "570")
 GPUUP_DEFAULT_DRIVER="580"
 
 declare -A GPUUP_CUDA_MIN_DRIVER=(
+  ["13.0"]=580.0
   ["12.4"]=550.54.14
   ["12.6"]=560.28.03
   ["12.8"]=570.26
@@ -255,8 +267,12 @@ GPUUP_ARCH=""
 GPUUP_REPO_ARCH=""
 GPUUP_IS_WSL=0
 GPUUP_GPU_NAMES=()
+GPUUP_GPU_CAPS=()
 GPUUP_GPU_CLASSES=()
 GPUUP_NEEDS_FABRIC=0
+GPUUP_LEGACY_FLEET=0
+GPUUP_DRIVER_PENDING_REBOOT=0
+GPUUP_NVSMI_FAILURE_MESSAGE=""
 GPUUP_EFFECTIVE_CUDA=""
 GPUUP_EFFECTIVE_DRIVER=""
 GPUUP_NVCC_PATH_NOTE=""
@@ -272,8 +288,8 @@ gpuup_usage() {
 Usage: gpuup [options]
 
 Options:
-  --cuda {12.4|12.6|12.8|12.9|auto}   Select CUDA toolkit version (default auto)
-  --driver {580|570|auto}             Select driver branch (default auto)
+  --cuda {13.0|12.9|12.8|12.6|12.4|auto}   Select CUDA toolkit version (default auto)
+  --driver {580|575|570|auto}              Select driver branch (default auto)
   --open-modules                      Install open kernel modules (default)
   --closed-modules                    Install proprietary kernel modules
   --fabric-manager                    Force Fabric Manager installation
@@ -461,6 +477,64 @@ gpuup_detect_nvcc_path() {
   return 1
 }
 
+gpuup_driver_branch_from_version() {
+  local version="$1"
+  if [[ "$version" =~ ^([0-9]{3}) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+gpuup_driver_branch_ge() {
+  local installed="$1"
+  local required="$2"
+  if [[ -z "$installed" || "$installed" == "not detected" ]]; then
+    return 1
+  fi
+  local branch
+  if ! branch=$(gpuup_driver_branch_from_version "$installed"); then
+    return 1
+  fi
+  local have=$((10#$branch))
+  local need=$((10#$required))
+  if (( have >= need )); then
+    return 0
+  fi
+  return 1
+}
+
+gpuup_version_ge() {
+  local have="$1"
+  local want="$2"
+  if [[ -z "$have" || "$have" == "not detected" || "$have" == "present" ]]; then
+    return 1
+  fi
+  local have_major have_minor want_major want_minor
+  if [[ "$have" =~ ^([0-9]+)(\.([0-9]+))? ]]; then
+    have_major=${BASH_REMATCH[1]}
+    have_minor=${BASH_REMATCH[3]:-0}
+  else
+    return 1
+  fi
+  if [[ "$want" =~ ^([0-9]+)(\.([0-9]+))? ]]; then
+    want_major=${BASH_REMATCH[1]}
+    want_minor=${BASH_REMATCH[3]:-0}
+  else
+    return 0
+  fi
+  if (( have_major > want_major )); then
+    return 0
+  fi
+  if (( have_major < want_major )); then
+    return 1
+  fi
+  if (( have_minor >= want_minor )); then
+    return 0
+  fi
+  return 1
+}
+
 gpuup_ensure_profile_exports() {
   # shellcheck disable=SC2016
   local snippet='export PATH=/usr/local/cuda/bin:$PATH
@@ -489,7 +563,23 @@ gpuup_short_circuit_success() {
   if gpuup_have nvidia-smi && nvidia-smi >/dev/null 2>&1; then
     smi_ok=1
   fi
+  local driver_ok=1
+  local cuda_ok=1
+  if [[ "$GPUUP_EFFECTIVE_DRIVER" != "auto" && -n "$GPUUP_EFFECTIVE_DRIVER" ]]; then
+    if ! gpuup_driver_branch_ge "$GPUUP_INSTALLED_DRIVER" "$GPUUP_EFFECTIVE_DRIVER"; then
+      driver_ok=0
+    fi
+  fi
+  if [[ "$GPUUP_EFFECTIVE_CUDA" != "auto" && -n "$GPUUP_EFFECTIVE_CUDA" ]]; then
+    if ! gpuup_version_ge "$GPUUP_INSTALLED_CUDA" "$GPUUP_EFFECTIVE_CUDA"; then
+      cuda_ok=0
+    fi
+  fi
   if (( nvcc_ok && smi_ok )); then
+    if (( ! driver_ok || ! cuda_ok )); then
+      gpuup_log "Existing driver/toolkit below recommended levels; continuing with installation."
+      return 1
+    fi
     if [[ -n "$GPUUP_NVCC_PATH_NOTE" ]]; then
       gpuup_offer_shell_exports
       gpuup_log "To use nvcc in this shell, run: export PATH=/usr/local/cuda/bin:\\$PATH"
@@ -504,9 +594,20 @@ gpuup_short_circuit_success() {
 
 gpuup_collect_gpus() {
   GPUUP_GPU_NAMES=()
-  if gpuup_have nvidia-smi && nvidia-smi --query-gpu=name --format=csv,noheader >/tmp/gpuup.gpus 2>/dev/null; then
-    while IFS= read -r name; do
-      [[ -n "$name" ]] && GPUUP_GPU_NAMES+=("$name")
+  GPUUP_GPU_CAPS=()
+  if gpuup_have nvidia-smi && nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader >/tmp/gpuup.gpus 2>/dev/null; then
+    while IFS=',' read -r name cap; do
+      [[ -z "$name" ]] && continue
+      name="${name#"${name%%[![:space:]]*}"}"
+      name="${name%"${name##*[![:space:]]}"}"
+      if [[ -n "$cap" ]]; then
+        cap="${cap#"${cap%%[![:space:]]*}"}"
+        cap="${cap%"${cap##*[![:space:]]}"}"
+      else
+        cap="unknown"
+      fi
+      GPUUP_GPU_NAMES+=("$name")
+      GPUUP_GPU_CAPS+=("$cap")
     done < /tmp/gpuup.gpus
     rm -f /tmp/gpuup.gpus
   fi
@@ -514,15 +615,24 @@ gpuup_collect_gpus() {
     if ! gpuup_have lspci; then
       if (( GPUUP_PLAN_ONLY || GPUUP_DRY_RUN )); then
         GPUUP_GPU_NAMES+=("undetected (plan mode)")
+        GPUUP_GPU_CAPS+=("unknown")
         return
       fi
       gpuup_run sudo apt-get update
       gpuup_run sudo apt-get install -y pciutils
     fi
     mapfile -t GPUUP_GPU_NAMES < <(lspci -nn | grep -i nvidia || true)
+    if ((${#GPUUP_GPU_CAPS[@]} < ${#GPUUP_GPU_NAMES[@]})); then
+      local remaining=$(( ${#GPUUP_GPU_NAMES[@]} - ${#GPUUP_GPU_CAPS[@]} ))
+      while (( remaining > 0 )); do
+        GPUUP_GPU_CAPS+=("unknown")
+        remaining=$((remaining - 1))
+      done
+    fi
   fi
   if ((${#GPUUP_GPU_NAMES[@]} == 0)); then
     GPUUP_GPU_NAMES+=("none detected")
+    GPUUP_GPU_CAPS+=("unknown")
   fi
 }
 
@@ -537,28 +647,81 @@ gpuup_fabric_pref_from_flag() {
 gpuup_gpu_classify() {
   GPUUP_GPU_CLASSES=()
   GPUUP_NEEDS_FABRIC=0
-  local name
+  GPUUP_LEGACY_FLEET=0
+  local idx=0
   for name in "${GPUUP_GPU_NAMES[@]}"; do
     local cls="unknown"
-    case "$name" in
-      *GB200*|*B200*|*GH200*|*"Grace Hopper"*|*Grace*|*H200*|*H100*|*HGX*|*Blackwell*)
-        cls="hopper"
-        GPUUP_NEEDS_FABRIC=1
+    local cap="${GPUUP_GPU_CAPS[$idx]:-unknown}"
+    if [[ "$cap" =~ ^[0-9] ]]; then
+      case "$cap" in
+        5.*)
+          cls="maxwell"
+          GPUUP_LEGACY_FLEET=1
+          ;;
+        6.*)
+          cls="pascal"
+          GPUUP_LEGACY_FLEET=1
+          ;;
+        7.0*|7.2*)
+          cls="volta"
+          GPUUP_LEGACY_FLEET=1
+          ;;
+        7.5*)
+          cls="turing"
+          ;;
+        8.0*|8.6*)
+          cls="ampere"
+          ;;
+        8.9*)
+          cls="ada"
+          ;;
+        9.*)
+          cls="hopper"
+          GPUUP_NEEDS_FABRIC=1
+          ;;
+        10.*)
+          cls="blackwell"
+          GPUUP_NEEDS_FABRIC=1
+          ;;
+        12.*)
+          cls="blackwell-consumer"
+          ;;
+      esac
+    fi
+    if [[ "$cls" == "unknown" ]]; then
+      case "$name" in
+        *GB200*|*B200*|*GH200*|*"Grace Hopper"*|*Grace*|*H200*|*H100*|*HGX*|*Blackwell*)
+          cls="hopper"
+          GPUUP_NEEDS_FABRIC=1
+          ;;
+        *L40S*|*L40*|*L4*|*"RTX 6000 Ada"*|*"RTX 5000 Ada"*|*"RTX 4000 Ada"*)
+          cls="ada"
+          ;;
+        *A100*|*A800*|*A30*|*A40*|*A16*|*A2*)
+          cls="ampere"
+          ;;
+        *T4*|*"RTX 20"*|*"RTX 2060"*|*"RTX 2070"*|*"RTX 2080"*|*"GTX 16"*|*"TITAN RTX"*)
+          cls="turing"
+          ;;
+        *V100*|*TITAN\ V*)
+          cls="volta"
+          GPUUP_LEGACY_FLEET=1
+          ;;
+        *P100*|*P40*|*P4*|*GTX\ 10*|*TITAN\ Xp*)
+          cls="pascal"
+          GPUUP_LEGACY_FLEET=1
+          ;;
+        *GTX\ 9*|*GTX\ 7*|*GTX\ 8*|*M60*|*M40*)
+          cls="maxwell"
+          GPUUP_LEGACY_FLEET=1
+          ;;
+        *K80*|*K40*|*K20*|*K520*|*GK*)
+          cls="kepler"
         ;;
-      *L40S*|*L40*|*L4*|*"RTX 6000 Ada"*|*"RTX 5000 Ada"*|*"RTX 4000 Ada"*)
-        cls="ada"
-        ;;
-      *A100*|*A800*|*A30*|*A40*|*A16*|*A2*)
-        cls="ampere"
-        ;;
-      *T4*|*"TITAN V"*|*V100*|*P100*)
-        cls="turing"
-        ;;
-      *K80*|*K40*|*K20*|*K520*|*GK*)
-        cls="kepler"
-        ;;
-    esac
+      esac
+    fi
     GPUUP_GPU_CLASSES+=("$cls")
+    idx=$((idx + 1))
   done
 
   local all_kepler=1
@@ -580,6 +743,16 @@ gpuup_gpu_classify() {
   fi
 }
 
+gpuup_set_default_versions() {
+  if (( GPUUP_LEGACY_FLEET )); then
+    GPUUP_DEFAULT_CUDA="12.9"
+    GPUUP_DEFAULT_DRIVER="575"
+  else
+    GPUUP_DEFAULT_CUDA="13.0"
+    GPUUP_DEFAULT_DRIVER="580"
+  fi
+}
+
 gpuup_interactive_print_summary() {
   gpuup_log "Detected environment:"
   printf '  OS: Ubuntu %s (%s)\n' "$GPUUP_OS_VERSION" "$GPUUP_ARCH"
@@ -587,7 +760,8 @@ gpuup_interactive_print_summary() {
   local idx=0
   for name in "${GPUUP_GPU_NAMES[@]}"; do
     local cls="${GPUUP_GPU_CLASSES[$idx]:-unknown}"
-    printf '    - %s [%s]\n' "$name" "$cls"
+    local cap="${GPUUP_GPU_CAPS[$idx]:-unknown}"
+    printf '    - %s [%s, cc=%s]\n' "$name" "$cls" "$cap"
     idx=$((idx + 1))
   done
   printf '  Installed driver: %s\n' "$GPUUP_INSTALLED_DRIVER"
@@ -627,21 +801,34 @@ gpuup_interactive_customize() {
   GPUUP_MODULE_FLAVOR="$selected_module"
 }
 
+gpuup_branch_floor_version() {
+  local branch="$1"
+  case "$branch" in
+    580) printf '580.0' ;;
+    575) printf '575.0' ;;
+    570) printf '570.0' ;;
+    *) return 1 ;;
+  esac
+}
+
 gpuup_selection_supported() {
   local cuda="$1"
   local driver="$2"
-  case "$driver" in
-    580|575|auto) return 0 ;;
-    570)
-      if [[ "$cuda" == "12.9" ]]; then
-        return 1
-      fi
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  if [[ "$driver" == "auto" ]]; then
+    return 0
+  fi
+  local min="${GPUUP_CUDA_MIN_DRIVER[$cuda]:-}"
+  if [[ -z "$min" ]]; then
+    return 0
+  fi
+  local floor
+  if ! floor=$(gpuup_branch_floor_version "$driver"); then
+    return 1
+  fi
+  if dpkg --compare-versions "$floor" ge "$min"; then
+    return 0
+  fi
+  return 1
 }
 
 gpuup_interactive_flow() {
@@ -775,23 +962,16 @@ gpuup_verify_driver_cuda_matrix() {
     return
   fi
   GPUUP_MIN_DRIVER_REQUIRED="$min_driver"
-  case "$GPUUP_EFFECTIVE_DRIVER" in
-    580)
-      return
-      ;;
-    575)
-      return
-      ;;
-    570)
-      if [[ "$cuda" == "12.9" ]]; then
-        gpuup_err "CUDA 12.9 requires driver >=575.51.03; branch 570 is insufficient"
-      fi
-      return
-      ;;
-    *)
-      gpuup_err "unknown driver branch ${GPUUP_EFFECTIVE_DRIVER}"
-      ;;
-  esac
+  if [[ "$GPUUP_EFFECTIVE_DRIVER" == "auto" ]]; then
+    return
+  fi
+  local floor
+  if ! floor=$(gpuup_branch_floor_version "$GPUUP_EFFECTIVE_DRIVER"); then
+    gpuup_err "unknown driver branch ${GPUUP_EFFECTIVE_DRIVER}"
+  fi
+  if dpkg --compare-versions "$floor" lt "$min_driver"; then
+    gpuup_err "CUDA ${cuda} requires driver >=${min_driver}; branch ${GPUUP_EFFECTIVE_DRIVER} is insufficient"
+  fi
 }
 
 gpuup_package_for_driver() {
@@ -951,9 +1131,10 @@ gpuup_resolve_toolkit_version_runtime() {
   local candidates=()
   if [[ "$GPUUP_REQUESTED_CUDA" == "auto" ]]; then
     case "$GPUUP_EFFECTIVE_DRIVER" in
-      580) candidates=("12.9" "12.8" "12.6" "12.4") ;;
+      580) candidates=("13.0" "12.9" "12.8" "12.6" "12.4") ;;
+      575) candidates=("12.9" "12.8" "12.6" "12.4") ;;
       570) candidates=("12.8" "12.6" "12.4") ;;
-      *) candidates=("12.9" "12.8" "12.6" "12.4") ;;
+      *) candidates=("13.0" "12.9" "12.8" "12.6" "12.4") ;;
     esac
   else
     candidates=("$GPUUP_REQUESTED_CUDA")
@@ -992,7 +1173,7 @@ gpuup_resolve_toolkit_version_runtime() {
     return
   fi
   if [[ "$GPUUP_REQUESTED_CUDA" == "auto" ]]; then
-    gpuup_err "no supported CUDA toolkit packages (12.9, 12.8, 12.6, 12.4) available in CUDA repository"
+    gpuup_err "no supported CUDA toolkit packages (13.0, 12.9, 12.8, 12.6, 12.4) available in CUDA repository"
   else
     gpuup_err "requested CUDA toolkit $GPUUP_REQUESTED_CUDA unavailable in repository"
   fi
@@ -1009,13 +1190,31 @@ gpuup_resolve_driver_branch_runtime() {
     branches=("$GPUUP_REQUESTED_DRIVER")
   fi
   if gpuup_have nvidia-smi; then
-    local installed
-    installed=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]')
-    if [[ -n "$installed" ]]; then
-      if [[ "$installed" =~ ^([0-9]{3}) ]]; then
+    local installed smi_output
+    if smi_output=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null); then
+      installed=$(printf '%s\n' "$smi_output" | head -n1 | tr -d '[:space:]')
+      if [[ -n "$installed" && "$installed" =~ ^([0-9]{3}) ]]; then
         local branch_hint="${BASH_REMATCH[1]}"
         case "$branch_hint" in
-          580|579|578|577|576|575|574|573|572|571|570) branches=($branch_hint "${branches[@]}") ;;
+          58[0-9]|57[0-9])
+            local seen=0
+            local existing
+            for existing in "${branches[@]}"; do
+              if [[ "$existing" == "$branch_hint" ]]; then
+                seen=1
+                break
+              fi
+            done
+            if (( ! seen )); then
+              local hint_val=$((10#$branch_hint))
+              local default_val=$((10#$GPUUP_DEFAULT_DRIVER))
+              if (( hint_val >= default_val )); then
+                branches=("$branch_hint" "${branches[@]}")
+              else
+                branches+=("$branch_hint")
+              fi
+            fi
+            ;;
         esac
       fi
     fi
@@ -1037,7 +1236,7 @@ gpuup_resolve_driver_branch_runtime() {
     fi
   done
   if [[ "$GPUUP_REQUESTED_DRIVER" == "auto" ]]; then
-    gpuup_err "no supported driver branches (580, 570) available in CUDA repository"
+    gpuup_err "no supported driver branches (580, 575, 570) available in CUDA repository"
   else
     gpuup_err "requested driver branch $GPUUP_REQUESTED_DRIVER unavailable in repository"
   fi
@@ -1107,12 +1306,12 @@ gpuup_install_driver_toolkit() {
 
 gpuup_uninstall() {
   local pkgs=(
-    cuda-toolkit-12-9 cuda-toolkit-12-8 cuda-toolkit-12-6 cuda-toolkit-12-4
-    cuda-drivers cuda-drivers-580 cuda-drivers-570
-    cuda-drivers-fabricmanager-580 cuda-drivers-fabricmanager-570
-    nvidia-open nvidia-open-580 nvidia-open-570
-    nvidia-driver-580 nvidia-driver-570
-    nvidia-fabricmanager nvidia-fabricmanager-580 nvidia-fabricmanager-570
+    cuda-toolkit-13-0 cuda-toolkit-12-9 cuda-toolkit-12-8 cuda-toolkit-12-6 cuda-toolkit-12-4
+    cuda-drivers cuda-drivers-580 cuda-drivers-575 cuda-drivers-570
+    cuda-drivers-fabricmanager-580 cuda-drivers-fabricmanager-575 cuda-drivers-fabricmanager-570
+    nvidia-open nvidia-open-580 nvidia-open-575 nvidia-open-570
+    nvidia-driver-580 nvidia-driver-575 nvidia-driver-570
+    nvidia-fabricmanager nvidia-fabricmanager-580 nvidia-fabricmanager-575 nvidia-fabricmanager-570
   )
   if (( GPUUP_PLAN_ONLY )); then
     printf 'plan: apt-get remove --purge %s\n' "${pkgs[*]}"
@@ -1231,6 +1430,10 @@ gpuup_offer_shell_exports() {
   GPUUP_SHELL_EXPORT_PATH="$target"
 
   local marker="# gpuup CUDA exports"
+  local legacy_exports=0
+  if [[ -f "$target" ]] && grep -Eq '/usr/local/cuda-[0-9]+\.[0-9]+' "$target"; then
+    legacy_exports=1
+  fi
   if ! grep -Fq "$marker" "$target" 2>/dev/null; then
     gpuup_log "Appending CUDA PATH exports to $target"
     cat <<'EOS' >> "$target"
@@ -1254,13 +1457,27 @@ EOS
 
   hash -r 2>/dev/null || true
 
+  if (( legacy_exports )); then
+    gpuup_warn "Detected legacy CUDA exports in $target; remove any /usr/local/cuda-*/ entries to prevent stale nvcc versions."
+  fi
+
   if gpuup_have nvcc; then
     nvcc --version || true
   else
     gpuup_warn "nvcc still not on PATH; open a new shell session or source $target manually."
   fi
 
-  gpuup_log "Run: source $GPUUP_SHELL_EXPORT_PATH (or open a new shell) to refresh CUDA PATH exports."
+  local alt_rc=""
+  local zsh_rc="$home_dir/.zshrc"
+  if [[ "$GPUUP_SHELL_EXPORT_PATH" != "$zsh_rc" && -f "$zsh_rc" ]]; then
+    alt_rc="$zsh_rc"
+  fi
+
+  if [[ -n "$alt_rc" ]]; then
+    gpuup_log "Run: source $GPUUP_SHELL_EXPORT_PATH or source $alt_rc (or open a new shell) to refresh CUDA PATH exports."
+  else
+    gpuup_log "Run: source $GPUUP_SHELL_EXPORT_PATH (or open a new shell) to refresh CUDA PATH exports."
+  fi
 }
 
 gpuup_plan_report() {
@@ -1272,7 +1489,8 @@ gpuup_plan_report() {
   local idx=0
   for name in "${GPUUP_GPU_NAMES[@]}"; do
     local cls="${GPUUP_GPU_CLASSES[$idx]:-unknown}"
-    printf '    - name: %s\n      class: %s\n' "$name" "$cls"
+    local cap="${GPUUP_GPU_CAPS[$idx]:-unknown}"
+    printf '    - name: %s\n      class: %s\n      compute_cap: %s\n' "$name" "$cls" "$cap"
     idx=$((idx + 1))
   done
   printf '  driver_branch: %s\n' "$GPUUP_EFFECTIVE_DRIVER"
@@ -1360,8 +1578,16 @@ gpuup_main() {
   gpuup_detect_wsl
   gpuup_collect_gpus
   gpuup_detect_installed_versions
+  if (( GPUUP_DRIVER_PENDING_REBOOT )); then
+    local msg="${GPUUP_NVSMI_FAILURE_MESSAGE//$'\n'/ }"
+    if [[ -n "$msg" ]]; then
+      gpuup_warn "$msg"
+    fi
+    gpuup_err "Detected NVIDIA driver/library mismatch. Reboot to load the new driver, then rerun gpuup (--verify-only)."
+  fi
   gpuup_fabric_pref_from_flag
   gpuup_gpu_classify
+  gpuup_set_default_versions
 
   if (( GPUUP_INTERACTIVE )); then
     gpuup_interactive_flow
