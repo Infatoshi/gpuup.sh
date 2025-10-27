@@ -1,0 +1,24 @@
+# Logs and transcripts generated locally
+gpuup-debug.log
+transcripts/
+!transcripts/.gitkeep
+
+# Deployment and ancillary tooling
+deploy.sh
+index.html
+assets/
+debug.sh
+PROVE.md
+README-automated-tests.md
+config/
+.github/
+
+# Environment files and editor cruft
+.env
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+__pycache__/
+.venv/
