@@ -7,7 +7,6 @@ transcripts/
 deploy.sh
 index.html
 assets/
-debug.sh
 PROVE.md
 README-automated-tests.md
 config/
