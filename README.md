@@ -22,7 +22,7 @@ curl -fsSL https://get.gpuup.sh | bash
 - When piping the installer (`curl … | bash`) from a non-interactive session, use `curl … | env GPUUP_FORCE_STDIN=1 bash` (note the `env` before `bash`) or prefer `bash <(curl …)` so the guided prompts remain available. Set `GPUUP_PROMPT_TIMEOUT=<seconds>` if you want prompts to auto-fail after a delay.
 - Hardware detection now defaults to installing CUDA 13.0 with the R580 driver branch for compute capability 7.5 and newer GPUs; Maxwell, Pascal, and Volta boards automatically fall back to CUDA 12.9 on R575 so older fleets stay functional.
 - After an upgrade, remove any legacy `export PATH=/usr/local/cuda-*/bin:$PATH` or `LD_LIBRARY_PATH=/usr/local/cuda-*/lib64` lines from your shell rc, then `source ~/.bashrc` (or `source ~/.zshrc`) to pick up the new CUDA 13.0 toolchain before rebooting.
-- If GPUup reports a “driver/library version mismatch”, finish the reboot before running the installer again; afterwards run `gpuup --verify-only` to confirm the driver and toolkit loaded.
+- If you see `Driver/library version mismatch`, reboot to finish loading the new modules before re-running the installer, then follow up with `gpuup --verify-only`.
 
 By default the installer keeps or installs the proprietary NVIDIA driver branch that satisfies the CUDA minimum. If the repository cannot provide the requested version, GPUup keeps the existing driver when it is compatible. Use `--interactive` if you need to override this behavior.
 

@@ -214,10 +214,9 @@ gpuup_detect_installed_versions() {
     fi
   fi
   if gpuup_detect_nvcc_path && nvcc --version >/dev/null 2>&1; then
-    local nvcc_line
-    nvcc_line=$(nvcc --version 2>/dev/null | tail -n1)
-    if [[ "$nvcc_line" =~ release[[:space:]]([0-9]+\.[0-9]+) ]]; then
-      GPUUP_INSTALLED_CUDA="${BASH_REMATCH[1]}"
+    local nvcc_release
+    if nvcc_release=$(gpuup_parse_nvcc_version); then
+      GPUUP_INSTALLED_CUDA="$nvcc_release"
     else
       GPUUP_INSTALLED_CUDA="present"
     fi
@@ -477,6 +476,20 @@ gpuup_detect_nvcc_path() {
   return 1
 }
 
+gpuup_parse_nvcc_version() {
+  if ! gpuup_have nvcc; then
+    return 1
+  fi
+  local output release
+  output=$(nvcc --version 2>/dev/null) || return 1
+  release=$(printf '%s\n' "$output" | sed -n 's/.*release[[:space:]]\([0-9.]\+\).*/\1/p' | head -n1)
+  if [[ -n "$release" ]]; then
+    printf '%s' "$release"
+    return 0
+  fi
+  return 1
+}
+
 gpuup_driver_branch_from_version() {
   local version="$1"
   if [[ "$version" =~ ^([0-9]{3}) ]]; then
@@ -556,8 +569,16 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}'
 
 gpuup_short_circuit_success() {
   local nvcc_ok=0
+  local detected_cuda="$GPUUP_INSTALLED_CUDA"
   if gpuup_detect_nvcc_path && nvcc --version >/dev/null 2>&1; then
     nvcc_ok=1
+    local nvcc_release
+    if nvcc_release=$(gpuup_parse_nvcc_version); then
+      detected_cuda="$nvcc_release"
+      GPUUP_INSTALLED_CUDA="$detected_cuda"
+    else
+      detected_cuda="present"
+    fi
   fi
   local smi_ok=0
   if gpuup_have nvidia-smi && nvidia-smi >/dev/null 2>&1; then
@@ -571,7 +592,7 @@ gpuup_short_circuit_success() {
     fi
   fi
   if [[ "$GPUUP_EFFECTIVE_CUDA" != "auto" && -n "$GPUUP_EFFECTIVE_CUDA" ]]; then
-    if ! gpuup_version_ge "$GPUUP_INSTALLED_CUDA" "$GPUUP_EFFECTIVE_CUDA"; then
+    if ! gpuup_version_ge "$detected_cuda" "$GPUUP_EFFECTIVE_CUDA"; then
       cuda_ok=0
     fi
   fi
